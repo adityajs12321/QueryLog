@@ -1,0 +1,6 @@
+ad_simulated_log.csv
+.DS_Store
+__pycache__/interface.cpython-313.pyc
+__pycache__/ETL.cpython-313.pyc
+/query_log/
+/Tests/
