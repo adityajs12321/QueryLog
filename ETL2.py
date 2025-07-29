@@ -9,6 +9,7 @@ import time
 import re
 from bs4 import BeautifulSoup
 from sentence_transformers import SentenceTransformer
+import ast
 
 def gemini_response(client: genai.Client, messages: list, model: str, format=None) -> str:
     chat_history = []
@@ -152,10 +153,9 @@ def create_index(es_client: Elasticsearch, index_name):
         es_client.indices.delete(index=index_name)
     
     try:
-        es_client.indices.create(index=index_name)
-        # mapping = es_client.indices.get_mapping(index="unstructured_logs_index")
-        # mapping[index_name]['mappings']['properties']['Action'] = {"type": "dense_vector", "dims": 384, "index": True, "similarity": "cosine"}
-        # es_client.indices.put_mapping(index=index_name, body=mapping)
+        # es_client.indices.create(index=index_name)
+        mapping = {'mappings': {'properties': {'Action': {'type': 'text', 'fields': {'keyword': {'type': 'keyword', 'ignore_above': 256}}}, "Action_vector": {"type": "dense_vector", "dims": 384, "index": True, "similarity": "cosine"}, 'Channel': {'type': 'text', 'fields': {'keyword': {'type': 'keyword', 'ignore_above': 256}}}, 'Computer': {'type': 'text', 'fields': {'keyword': {'type': 'keyword', 'ignore_above': 256}}}, 'EventID': {'type': 'long'}, 'EventRecordID': {'type': 'long'}, 'Keywords': {'type': 'text', 'fields': {'keyword': {'type': 'keyword', 'ignore_above': 256}}}, 'Level': {'type': 'long'}, 'Opcode': {'type': 'text', 'fields': {'keyword': {'type': 'keyword', 'ignore_above': 256}}}, 'ProviderName': {'type': 'text', 'fields': {'keyword': {'type': 'keyword', 'ignore_above': 256}}}, 'SubjectUserName': {'type': 'text', 'fields': {'keyword': {'type': 'keyword', 'ignore_above': 256}}}, 'TargetUserName': {'type': 'text', 'fields': {'keyword': {'type': 'keyword', 'ignore_above': 256}}}, 'Task': {'type': 'long'}, 'TimeCreated': {'type': 'date'}, 'Version': {'type': 'long'}}}}
+        es_client.indices.create(index=index_name, body=mapping)
         print(f"Index '{index_name}' created")
     except Exception as e:
         print(f"Error creating index: {e}")
@@ -166,8 +166,8 @@ def index_data_to_elasticsearch(es_client, model, index_name, data):
         return
     actions = []
     for record in data:
-        # embedding = model.encode(record.get("Action"))
-        # record["Action"] = embedding.tolist()  # Convert numpy array to list for JSON serialization
+        embedding = model.encode(record.get("Action"))
+        record["Action_vector"] = embedding.tolist()  # Convert numpy array to list for JSON serialization
         action = {
             "_index": index_name,
             "_source": record
@@ -198,6 +198,35 @@ def setvalue(nested_dict, value, set_value):
         elif hasattr(v, 'items'): # v is a dict
             setvalue(nested_dict[k], value, set_value) # recursive call
 
+def switch_to_knn(nested_dict, model):
+    for k, v in nested_dict.items():
+        if k == "match": # found value
+            if ("Action" in list(v.keys())):
+                embedded_message = model.encode(nested_dict[k]["Action"])
+                nested_dict["knn"] = {
+                        "field": "Action_vector",
+                        "query_vector": embedded_message.tolist(),
+                        "k": 50,
+                        "num_candidates": 100
+                    }
+                
+                del nested_dict[k]
+            return None
+        elif hasattr(v, 'items'): # v is a dict
+            switch_to_knn(nested_dict[k], model) # recursive call
+        elif isinstance(v, list):
+            for i in range(len(v)):
+                if v[i].get("match") is not None:
+                    if (list(v[i].get("match").keys())[0] == "Action"):
+                        embedded_message = model.encode(nested_dict[k][i]["match"]["Action"])
+                        nested_dict[k][i] = {"knn": {
+                            "field": "Action_vector",
+                            "query_vector": embedded_message.tolist(),
+                            "k": 50,
+                            "num_candidates": 100
+                        }}
+                        return None
+
 def search_documents(es_client, model, index_name, query):
     """
     Searches for documents in the specified index using the given query.
@@ -205,10 +234,10 @@ def search_documents(es_client, model, index_name, query):
     if not es_client:
         return
     
-    # query_string = getvalue(query, "Action")
-    # if query_string is not None:
-    #     encoded_string = model.encode(query_string)
-    #     setvalue(query, "Action", encoded_string.tolist())
+    query_string = getvalue(query, "Action")
+    if query_string is not None:
+        encoded_string = model.encode(query_string)
+        setvalue(query, "Action", encoded_string.tolist())
 
     search_results = []
     try:
@@ -217,6 +246,9 @@ def search_documents(es_client, model, index_name, query):
         hits = response['hits']['hits']
         aggregations = response.get("aggregations")
         print(f"Found {len(hits)} documents:")
+        if hits == []:
+            return search_results
+        
         if (aggregations == None):
             for hit in hits:
                 search_results.append(hit['_source'])
@@ -271,15 +303,16 @@ User: "Return all records that are associated with the computer ztran.corp.local
 Response: "{"query": {"term": {"Computer": "ztran.corp.local"}}}"
 
 User: "Who was removed from the security enabled local group"
-Response: "{"query": {"multi_match": {"query": "removed from security enabled local group"}, "fields": ["Action"], "minimum_should_match": 5}, "aggs": {"removed_from_group": {"terms": {"field": "TargetUserName.keyword"}}}}"
+Response: "{"query": {"match": {"Action": "removed from security enabled local group"}}, "aggs": {"removed_from_group": {"terms": {"field": "TargetUserName.keyword"}}}}"
 
-User: "Whose accounts were deleted"
-Response: "{"query": {"match": {"Action": "account deleted"}}, "aggs": {"deleted_accounts": {"terms": {"field": "TargetUserName.keyword"}}}}"
+User: "What time did natalierivera create an account"
+Response: "{"query": {"bool": {"must": [{"match": {"Action": "account created"}}, {"term": {"SubjectUserName.keyword": "natalierivera"}}]}}, "aggs": {"creation_times": {"min": {"field": "TimeCreated"}}}}"
 
-Use "multi_match" for long queries and use an appropriate number for "minimum_should_match" to ensure the query is specific enough (by counting the relevant words).
 Don' forget to add "query" to the start of the query.
 Follow JSON structure strictly.
 """
+
+model = SentenceTransformer('all-MiniLM-L6-v2')
 
 messages = [
         {"role": "system", "content": SYSTEM_PROMPT}
@@ -287,7 +320,7 @@ messages = [
 
 def search(query: str):
     messages.append({"role": "user", "content": query})
-    if (len(messages) > 3):
+    if (len(messages) > 6):
         messages.pop(1)
 
 
@@ -300,6 +333,7 @@ def search(query: str):
 
     query = response.Query
     print("\n\nResponse: ", query)
+    
 
     mongo_client = connect_to_mongodb()
 
@@ -330,43 +364,55 @@ def search(query: str):
     return []
 
 if __name__ == "__main__":
-    message = input("> ")
-    messages.append({"role": "user", "content": message})
+    while True:
+        message = input("> ")
+        messages.append({"role": "user", "content": message})
 
 
-    # llm.format = Query.model_json_schema()
-    # response = llm.invoke(messages)
+        # llm.format = Query.model_json_schema()
+        # response = llm.invoke(messages)
 
-    response = gemini_response(llm, messages, "gemini-2.5-flash", Query)
+        response = gemini_response(llm, messages, "gemini-2.5-flash", Query)
 
-    response = Query.model_validate_json(response)
+        response = Query.model_validate_json(response)
 
-    query = response.Query
-    print("\n\nResponse: ", query)
+        query = response.Query
+        print("\n\nResponse: ", query)
+        query = ast.literal_eval(query)
 
-    mongo_client = connect_to_mongodb()
+        switch_to_knn(query, model)
+        query["_source"] = {"excludes": ["Action_vector"]}
+        query["min_score"] = 0.9
 
-    if mongo_client:
-            # Fetch data from PostgreSQL
-        # with open("ad_simulated_events.xml", "r") as file:
-        #     data = file.read()
-        #     xml_file = ETL_XML(data)
-        #     insert_into_mongodb(mongo_client, "Logs", "unstructured_logs", xml_file)
+        mongo_client = connect_to_mongodb()
 
-        mongodb_data = fetch_data_from_mongodb(mongo_client, "Logs", "unstructured_logs")
-        mongo_client.close()
+        if mongo_client:
+                # Fetch data from PostgreSQL
+            # with open("ad_simulated_events.xml", "r") as file:
+            #     data = file.read()
+            #     xml_file = ETL_XML(data)
+            #     insert_into_mongodb(mongo_client, "Logs", "unstructured_logs", xml_file)
 
-        if mongodb_data:
-            # Elasticsearch connection details
-            es = connect_to_elasticsearch()
-            if es:
-                index_name = "unstructured_logs_index"
+            mongodb_data = fetch_data_from_mongodb(mongo_client, "Logs", "unstructured_logs")
+            mongo_client.close()
 
-                
-                create_index(es, index_name)
-                
-                # Index the data
-                index_data_to_elasticsearch(es, index_name, mongodb_data)
-                time.sleep(1)
+            if mongodb_data:
+                # Elasticsearch connection details
+                es = connect_to_elasticsearch()
+                if es:
+                    index_name = "unstructured_logs_index"
+                    
+                    create_index(es, index_name)
+                    
+                    # Index the data
+                    index_data_to_elasticsearch(es, model, index_name, mongodb_data)
+                    time.sleep(1)
 
-                search_documents(es, index_name, query)
+                    search_results = []
+                    while True:
+                        search_results = search_documents(es, model, index_name, query)
+                        if (search_results == []):
+                            query["min_score"] = query["min_score"] - 0.05
+                        else:
+                            query["min_score"] = 0.9
+                            break

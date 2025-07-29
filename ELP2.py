@@ -6,6 +6,7 @@ import json
 from datetime import datetime
 from bson import ObjectId
 from bs4 import BeautifulSoup
+from sentence_transformers import SentenceTransformer
 
 def ETL_XML(xml_file):
     events = BeautifulSoup(xml_file, "xml")
@@ -83,153 +84,127 @@ def connect_to_elasticsearch():
     else:
         print("Could not connect to Elasticsearch")
         return None
-    
-def connect_to_postgresql():
-    """Establishes a connection to the PostgreSQL database."""
-    try:
-        conn = psycopg2.connect(
-            dbname="adityajs",
-            user="adityajs",
-            password=os.environ["POSTGRE_PASS"],
-            port="5432"
-        )
-        return conn
-    except psycopg2.OperationalError as e:
-        print(f"Could not connect to PostgreSQL: {e}")
-        return None
-    
-def create_postgresql_table(conn, table_name, sample_document):
-    """Creates a PostgreSQL table based on MongoDB document structure."""
-    if not conn or not sample_document:
-        return False
-    
-    try:
-        cursor = conn.cursor()
-        
-        # Build CREATE TABLE statement
-        columns = []
-        for key, value in sample_document.items():
-            columns.append(f"{key} {value}")  # Default to TEXT for strings, JSON, etc.
-        
-        create_query = f"""
-        CREATE TABLE IF NOT EXISTS {table_name} (
-            {', '.join(columns)}
-        )
-        """
-        
-        cursor.execute(create_query)
-        conn.commit()
-        cursor.close()
-        print(f"Table '{table_name}' created successfully")
-        return True
-        
-    except psycopg2.Error as e:
-        print(f"Error creating table: {e}")
-        conn.rollback()
-        return False
-    
-def insert_data_to_postgresql(conn, table_name, data):
-    """Inserts data into PostgreSQL table."""
-    if not conn or not data:
-        return
-    
-    try:
-        cursor = conn.cursor()
-        
-        # Get column names from first document
-        columns = list(data[0].keys())
-        placeholders = ', '.join(['%s'] * len(columns))
-        
-        insert_query = f"""
-        INSERT INTO {table_name}
-        VALUES ({placeholders})
-        """
-        
-        # Prepare data for insertion
-        values_list = []
-        for doc in data:
-            values = [doc.get(col) for col in columns]
-            values_list.append(values)
-        
-        # Execute batch insert
-        cursor.executemany(insert_query, values_list)
-        conn.commit()
-        cursor.close()
-        print(f"Successfully inserted {len(data)} records into PostgreSQL")
-        
-    except psycopg2.Error as e:
-        print(f"Error inserting data: {e}")
-        conn.rollback()
-
-def fetch_conversation_from_postgres(conn, table_name, conversation_id):
-    """Fetches data from a specified table in PostgreSQL."""
-    if not conn:
-        return []
-    try:
-        cursor = conn.cursor()
-        cursor.execute(f"SELECT * FROM {table_name} WHERE id = {conversation_id}")
-        rows = cursor.fetchall()
-        columns = [desc[0] for desc in cursor.description]
-        cursor.close()
-        return [dict(zip(columns, row)) for row in rows]
-    except psycopg2.Error as e:
-        print(f"Error fetching data from PostgreSQL: {e}")
-        return []
 
 def create_index(es_client: Elasticsearch, index_name):
     """Creates an Elasticsearch index if it doesn't exist."""
 
     if es_client.indices.exists(index=index_name):
-        es_client.indices.delete(index=index_name, ignore=[400, 404])
+        es_client.indices.delete(index=index_name)
+    
     try:
-        es_client.indices.create(index=index_name)
+        # es_client.indices.create(index=index_name)
+        mapping = {'mappings': {'properties': {'Action': {'type': 'text', 'fields': {'keyword': {'type': 'keyword', 'ignore_above': 256}}}, "Action_vector": {"type": "dense_vector", "dims": 384, "index": True, "similarity": "cosine"}, 'Channel': {'type': 'text', 'fields': {'keyword': {'type': 'keyword', 'ignore_above': 256}}}, 'Computer': {'type': 'text', 'fields': {'keyword': {'type': 'keyword', 'ignore_above': 256}}}, 'EventID': {'type': 'long'}, 'EventRecordID': {'type': 'long'}, 'Keywords': {'type': 'text', 'fields': {'keyword': {'type': 'keyword', 'ignore_above': 256}}}, 'Level': {'type': 'long'}, 'Opcode': {'type': 'text', 'fields': {'keyword': {'type': 'keyword', 'ignore_above': 256}}}, 'ProviderName': {'type': 'text', 'fields': {'keyword': {'type': 'keyword', 'ignore_above': 256}}}, 'SubjectUserName': {'type': 'text', 'fields': {'keyword': {'type': 'keyword', 'ignore_above': 256}}}, 'TargetUserName': {'type': 'text', 'fields': {'keyword': {'type': 'keyword', 'ignore_above': 256}}}, 'Task': {'type': 'long'}, 'TimeCreated': {'type': 'date'}, 'Version': {'type': 'long'}}}}
+        es_client.indices.create(index=index_name, body=mapping)
         print(f"Index '{index_name}' created")
     except Exception as e:
         print(f"Error creating index: {e}")
 
-def index_data_to_elasticsearch(es_client, index_name, data):
+def index_data_to_elasticsearch(es_client, model, index_name, data):
     """Indexes data into the specified Elasticsearch index."""
-
     if not es_client or not data:
         return
-    actions = [
-        {
+    actions = []
+    for record in data:
+        embedding = model.encode(record.get("Action"))
+        record["Action_vector"] = embedding.tolist()  # Convert numpy array to list for JSON serialization
+        action = {
             "_index": index_name,
             "_source": record
         }
-        for record in data
-    ]
+        actions.append(action)
+
     try:
         helpers.bulk(es_client, actions)
         print("Data indexed successfully")
     except helpers.BulkIndexError as e:
         print(f"Error indexing data: {e}")
 
-def search_documents(es_client, index_name, query):
+def getvalue(nested_dict, value, prepath=()):
+    for k, v in nested_dict.items():
+        path = prepath + (k,)
+        if k == value: # found value
+            return v
+        elif hasattr(v, 'items'): # v is a dict
+            p = getvalue(v, value, path) # recursive call
+            if p is not None:
+                return p
+
+def setvalue(nested_dict, value, set_value):
+    for k, v in nested_dict.items():
+        if k == value: # found value
+            nested_dict[k] = set_value
+            return None
+        elif hasattr(v, 'items'): # v is a dict
+            setvalue(nested_dict[k], value, set_value) # recursive call
+
+def switch_to_knn(nested_dict, model):
+    for k, v in nested_dict.items():
+        if k == "match": # found value
+            if ("Action" in list(v.keys())):
+                embedded_message = model.encode(nested_dict[k]["Action"])
+                nested_dict["knn"] = {
+                        "field": "Action_vector",
+                        "query_vector": embedded_message.tolist(),
+                        "k": 50,
+                        "num_candidates": 100
+                    }
+                
+                del nested_dict[k]
+            return None
+        elif hasattr(v, 'items'): # v is a dict
+            switch_to_knn(nested_dict[k], model) # recursive call
+        elif isinstance(v, list):
+            for i in range(len(v)):
+                if v[i].get("match") is not None:
+                    if (list(v[i].get("match").keys())[0] == "Action"):
+                        embedded_message = model.encode(nested_dict[k][i]["match"]["Action"])
+                        nested_dict[k][i] = {"knn": {
+                            "field": "Action_vector",
+                            "query_vector": embedded_message.tolist(),
+                            "k": 50,
+                            "num_candidates": 100
+                        }}
+                        return None
+
+def search_documents(es_client, model, index_name, query):
     """
     Searches for documents in the specified index using the given query.
     """
     if not es_client:
         return
+    
+    query_string = getvalue(query, "Action")
+    if query_string is not None:
+        encoded_string = model.encode(query_string)
+        setvalue(query, "Action", encoded_string.tolist())
 
+    search_results = []
     try:
         response = es_client.search(index=index_name, body=query)
         # Extract the actual documents from the response
         hits = response['hits']['hits']
         aggregations = response.get("aggregations")
-        print(aggregations)
         print(f"Found {len(hits)} documents:")
+        if hits == []:
+            return search_results
+        
+        print(aggregations)
         if (aggregations == None):
             for hit in hits:
+                search_results.append(hit['_source'])
                 # Each hit contains the document in the _source field
                 print(hit['_source'])
         else:
             # print(aggregations)
             for bucket in list(aggregations.values()):
                 if (bucket.get("buckets") is not None):
+                    search_results.append(bucket["buckets"])
                     print(bucket["buckets"])
                 elif (bucket.get("value_as_string") is not None):
+                    search_results.append(bucket["value_as_string"])
                     print(bucket["value_as_string"])
+        
+        return search_results
     except Exception as e:
         print(f"An error occurred: {e}")
 
@@ -264,15 +239,45 @@ def search_documents(es_client, index_name, query):
 
 #                 search_documents(es, index_name, query)
 
+model = SentenceTransformer('all-MiniLM-L6-v2')
 
 # UNSTRUCTURED LOG QUERIES
 # query = {"query": {"match": {"Action": "removed from security-enabled local group"}}}
 # query = {"size": 10000, "query": {"multi_match": {"query": "account created", "minimum_should_match": "2"}}}
 # query = {"size": 50, "query": {"multi_match": {"query": "security settings", "minimum_should_match": 2}}}
 # query = {"query": {"match": {"Action": "account created"}}, "aggs": {"creation_time": {"terms": {"field": "SubjectUserName.keyword"}}}}
-# query = {"query": {"match": {"Action": "removed from a security-enabled local group"}}}
-# query = {"query": {"bool": {"must": [{"match": {"Action": "account created"}}, {"term": {"SubjectUserName.keyword": "natalierivera"}}]}}, "aggs": {"creation_time": {"min": {"field": "TimeCreated"}}}}
+# query = {"size": 50, "query": {"match": {"Action": "removed from security enabled local group"}}}
+# query = {"query": {"match": {"Action": "removed from security enabled local groups"}}, "aggs": {"users_removed": {"terms": {"field": "TargetUserName.keyword"}}}}
+# query = {"query": {"bool": {"must": [{"match": {"Action": "account created"}}, {"term": {"SubjectUserName.keyword": "natalierivera"}}]}}, "aggs": {"creation_times": {"terms": {"field": "TimeCreated"}}}}
+# query = {"query": {"match": {"Action": "reset password"}}}
+query = {"query": {"match": {"Action": "password reset"}}, "aggs": {"users_reset_password": {"terms": {"field": "SubjectUserName.keyword"}}}}
 
+# message = "removed from security enabled global group"
+# message = model.encode(message)
+# query = {"knn": {"field": "Action_vector","query_vector": message.tolist(),"k": 50,"num_candidates": 100}, "aggs": {"removed_users": {"terms": {"field": "TargetUserName.keyword"}}}, "_source": {"excludes": ["Action_vector"]}}
+
+# query = {"query": {"bool": {"must": [{"match": {"Action": "account created"}}, {"term": {"SubjectUserName.keyword": "natalierivera"}}]}}, "aggs": {"creation_time": {"min": {"field": "TimeCreated"}}}}
+# query = {"query": {"bool": {"must": [{"knn": {"field": "Action_vector","query_vector": message.tolist(),"k": 50,"num_candidates": 100}}, {"term": {"SubjectUserName.keyword": "natalierivera"}}]}}, "aggs": {"creation_time": {"min": {"field": "TimeCreated"}}}}
+
+
+switch_to_knn(query, model)
+query["_source"] = {"excludes": ["Action_vector"]}
+# print("Query: ", query)
+query["min_score"] = 0.9
+# PIPELINE
+# message = getvalue(query, "Action")
+# if message is not None:
+#     encoded_message = model.encode(message)
+#     del query["query"]
+#     query["knn"] = {
+#         "field": "Action_vector",
+#         "query_vector": encoded_message.tolist(),
+#         "k": 50,
+#         "num_candidates": 100
+#     }
+#     query["_source"] = {"excludes": ["Action_vector"]}
+
+  # Load the pre-trained model for sentence embeddings
 # Unstructured Logfile
 if __name__ == "__main__":
     # PostgreSQL connection details
@@ -298,7 +303,14 @@ if __name__ == "__main__":
                     create_index(es, index_name)
                         
                     # Index the data
-                    index_data_to_elasticsearch(es, index_name, mongodb_data)
+                    index_data_to_elasticsearch(es, model, index_name, mongodb_data)
                     time.sleep(1)
 
-                    search_documents(es, index_name, query)
+                    search_results = []
+                    while True:
+                        search_results = search_documents(es, model, index_name, query)
+                        if (search_results == []):
+                            query["min_score"] = query["min_score"] - 0.05
+                        else:
+                            query["min_score"] = 0.9
+                            break
